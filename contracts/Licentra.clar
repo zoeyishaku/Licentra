@@ -14,11 +14,17 @@
 (define-constant ERR-LISTING-EXPIRED (err u112))
 (define-constant ERR-CANNOT-BID-OWN-LISTING (err u113))
 (define-constant ERR-LISTING-NOT-ACTIVE (err u114))
+(define-constant ERR-SUBSCRIPTION-NOT-FOUND (err u115))
+(define-constant ERR-SUBSCRIPTION-INACTIVE (err u116))
+(define-constant ERR-SUBSCRIPTION-EXPIRED (err u117))
+(define-constant ERR-INVALID-BILLING-CYCLE (err u118))
+(define-constant ERR-SUBSCRIPTION-PAUSED (err u119))
 
 (define-data-var next-product-id uint u1)
 (define-data-var next-listing-id uint u1)
 (define-data-var next-bid-id uint u1)
 (define-data-var next-license-id uint u1)
+(define-data-var next-subscription-id uint u1)
 
 (define-map products
   { product-id: uint }
@@ -87,6 +93,38 @@
 (define-map user-listings
   { user: principal, license-id: uint }
   { listing-id: uint }
+)
+
+(define-map subscriptions
+  { subscription-id: uint }
+  {
+    product-id: uint,
+    subscriber: principal,
+    billing-cycle-blocks: uint,
+    price-per-cycle: uint,
+    start-block: uint,
+    last-billing-block: uint,
+    next-billing-block: uint,
+    active: bool,
+    paused: bool,
+    grace-period-blocks: uint,
+    auto-renew: bool,
+    created-at: uint
+  }
+)
+
+(define-map user-subscriptions
+  { user: principal, product-id: uint }
+  { subscription-id: uint }
+)
+
+(define-map subscription-billing-history
+  { subscription-id: uint, billing-cycle: uint }
+  {
+    amount: uint,
+    billing-block: uint,
+    success: bool
+  }
 )
 
 (define-public (create-product (name (string-ascii 100)) (description (string-ascii 500)) (price-per-block uint))
@@ -537,3 +575,202 @@
 (define-read-only (get-next-bid-id)
   (var-get next-bid-id)
 )
+
+(define-public (create-subscription (product-id uint) (billing-cycle-blocks uint) (price-per-cycle uint) (grace-period-blocks uint) (auto-renew bool))
+  (let
+    (
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR-NOT-FOUND))
+      (subscription-id (var-get next-subscription-id))
+      (current-block stacks-block-height)
+      (next-billing-block (+ current-block billing-cycle-blocks))
+      (existing-subscription (map-get? user-subscriptions { user: tx-sender, product-id: product-id }))
+    )
+    (asserts! (get active product) ERR-INVALID-PRODUCT)
+    (asserts! (> billing-cycle-blocks u0) ERR-INVALID-BILLING-CYCLE)
+    (asserts! (> price-per-cycle u0) ERR-INVALID-DURATION)
+    (asserts! (is-none existing-subscription) ERR-ALREADY-EXISTS)
+    
+    (try! (stx-transfer? price-per-cycle tx-sender (get owner product)))
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      {
+        product-id: product-id,
+        subscriber: tx-sender,
+        billing-cycle-blocks: billing-cycle-blocks,
+        price-per-cycle: price-per-cycle,
+        start-block: current-block,
+        last-billing-block: current-block,
+        next-billing-block: next-billing-block,
+        active: true,
+        paused: false,
+        grace-period-blocks: grace-period-blocks,
+        auto-renew: auto-renew,
+        created-at: current-block
+      }
+    )
+    
+    (map-set user-subscriptions
+      { user: tx-sender, product-id: product-id }
+      { subscription-id: subscription-id }
+    )
+    
+    (map-set subscription-billing-history
+      { subscription-id: subscription-id, billing-cycle: u1 }
+      {
+        amount: price-per-cycle,
+        billing-block: current-block,
+        success: true
+      }
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (renew-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+      (product-id (get product-id subscription))
+      (product (unwrap! (map-get? products { product-id: product-id }) ERR-NOT-FOUND))
+      (current-block stacks-block-height)
+      (next-billing (+ (get next-billing-block subscription) (get billing-cycle-blocks subscription)))
+      (grace-period-end (+ (get next-billing-block subscription) (get grace-period-blocks subscription)))
+      (billing-cycle-count (+ (/ (- current-block (get start-block subscription)) (get billing-cycle-blocks subscription)) u1))
+    )
+    (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+    (asserts! (not (get paused subscription)) ERR-SUBSCRIPTION-PAUSED)
+    (asserts! (>= current-block (get next-billing-block subscription)) ERR-SUBSCRIPTION-EXPIRED)
+    (asserts! (<= current-block grace-period-end) ERR-SUBSCRIPTION-EXPIRED)
+    
+    (try! (stx-transfer? (get price-per-cycle subscription) tx-sender (get owner product)))
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription {
+        last-billing-block: current-block,
+        next-billing-block: next-billing
+      })
+    )
+    
+    (map-set subscription-billing-history
+      { subscription-id: subscription-id, billing-cycle: billing-cycle-count }
+      {
+        amount: (get price-per-cycle subscription),
+        billing-block: current-block,
+        success: true
+      }
+    )
+    
+    (ok next-billing)
+  )
+)
+
+(define-public (pause-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) ERR-UNAUTHORIZED)
+    (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+    (asserts! (not (get paused subscription)) ERR-SUBSCRIPTION-PAUSED)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { paused: true })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resume-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+      (current-block stacks-block-height)
+      (new-next-billing (+ current-block (get billing-cycle-blocks subscription)))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) ERR-UNAUTHORIZED)
+    (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+    (asserts! (get paused subscription) ERR-SUBSCRIPTION-PAUSED)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription {
+        paused: false,
+        next-billing-block: new-next-billing
+      })
+    )
+    (ok new-next-billing)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) ERR-UNAUTHORIZED)
+    (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { active: false })
+    )
+    
+    (map-delete user-subscriptions { user: tx-sender, product-id: (get product-id subscription) })
+    (ok true)
+  )
+)
+
+(define-public (update-subscription-settings (subscription-id uint) (auto-renew bool) (grace-period-blocks uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) ERR-SUBSCRIPTION-NOT-FOUND))
+    )
+    (asserts! (is-eq tx-sender (get subscriber subscription)) ERR-UNAUTHORIZED)
+    (asserts! (get active subscription) ERR-SUBSCRIPTION-INACTIVE)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription {
+        auto-renew: auto-renew,
+        grace-period-blocks: grace-period-blocks
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-user-subscription (user principal) (product-id uint))
+  (match (map-get? user-subscriptions { user: user, product-id: product-id })
+    subscription-entry (map-get? subscriptions { subscription-id: (get subscription-id subscription-entry) })
+    none
+  )
+)
+
+(define-read-only (is-subscription-active (user principal) (product-id uint))
+  (match (get-user-subscription user product-id)
+    subscription (and
+      (get active subscription)
+      (not (get paused subscription))
+      (> (+ (get next-billing-block subscription) (get grace-period-blocks subscription)) stacks-block-height)
+    )
+    false
+  )
+)
+
+(define-read-only (get-subscription-billing-history (subscription-id uint) (billing-cycle uint))
+  (map-get? subscription-billing-history { subscription-id: subscription-id, billing-cycle: billing-cycle })
+)
+
+(define-read-only (get-next-subscription-id)
+  (var-get next-subscription-id)
+)
+
